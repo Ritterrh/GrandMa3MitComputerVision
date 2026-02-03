@@ -2,10 +2,15 @@
 """
 Person Tracker with OSC Output for grandMA3
 Tracks the closest person using MediaPipe Pose and sends coordinates via OSC
+Updated for MediaPipe 0.10.32+ API
 """
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from mediapipe import solutions
+from mediapipe.framework.formats import landmark_pb2
 import numpy as np
 from pythonosc import udp_client
 import time
@@ -22,16 +27,21 @@ class PersonTrackerOSC:
             osc_port: OSC port (default 8000)
             camera_id: Camera device ID (default 0)
         """
-        # Initialize MediaPipe Pose
-        self.mp_pose = mp.solutions.pose
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_drawing_styles = mp.solutions.drawing_styles
+        # Download the pose landmarker model if needed
+        model_path = 'pose_landmarker_lite.task'
         
-        self.pose = self.mp_pose.Pose(
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-            model_complexity=1
+        # Initialize MediaPipe Pose Landmarker
+        base_options = python.BaseOptions(model_asset_path=model_path)
+        options = vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
+            min_tracking_confidence=0.5
         )
+        
+        self.detector = vision.PoseLandmarker.create_from_options(options)
         
         # Initialize OSC client
         self.osc_client = udp_client.SimpleUDPClient(osc_ip, osc_port)
@@ -56,26 +66,25 @@ class PersonTrackerOSC:
         self.fps = 0
         self.frame_count = 0
         self.start_time = time.time()
+        self.timestamp_ms = 0
         
         print(f"✓ Person Tracker initialized")
         print(f"✓ OSC target: {osc_ip}:{osc_port}")
         print(f"✓ Camera resolution: {int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
         print(f"✓ Press 'q' to quit")
     
-    def get_closest_person_position(self, landmarks, image_width, image_height):
+    def get_closest_person_position(self, landmarks):
         """
         Extract the position of the closest person based on nose landmark
         
         Args:
             landmarks: MediaPipe pose landmarks
-            image_width: Width of the image
-            image_height: Height of the image
             
         Returns:
             tuple: (x, y) normalized coordinates (0.0 to 1.0)
         """
         # Use nose landmark (index 0) as the tracking point
-        nose = landmarks.landmark[self.mp_pose.PoseLandmark.NOSE]
+        nose = landmarks[0]  # NOSE landmark
         
         # Normalize coordinates (MediaPipe already provides normalized coords)
         x = nose.x  # 0.0 to 1.0 (left to right)
@@ -102,6 +111,43 @@ class PersonTrackerOSC:
             self.osc_client.send_message("/stage/person1/y", y)
         except Exception as e:
             print(f"OSC Error: {e}")
+    
+    def draw_landmarks_on_image(self, rgb_image, detection_result):
+        """
+        Draw pose landmarks on the image
+        
+        Args:
+            rgb_image: RGB image
+            detection_result: MediaPipe detection result
+            
+        Returns:
+            Annotated image
+        """
+        if not detection_result.pose_landmarks:
+            return rgb_image
+            
+        pose_landmarks_list = detection_result.pose_landmarks
+        annotated_image = np.copy(rgb_image)
+
+        # Loop through the detected poses to visualize
+        for idx in range(len(pose_landmarks_list)):
+            pose_landmarks = pose_landmarks_list[idx]
+
+            # Draw the pose landmarks
+            pose_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
+            pose_landmarks_proto.landmark.extend([
+                landmark_pb2.NormalizedLandmark(x=landmark.x, y=landmark.y, z=landmark.z) 
+                for landmark in pose_landmarks
+            ])
+            
+            solutions.drawing_utils.draw_landmarks(
+                annotated_image,
+                pose_landmarks_proto,
+                solutions.pose.POSE_CONNECTIONS,
+                solutions.drawing_styles.get_default_pose_landmarks_style()
+            )
+        
+        return annotated_image
     
     def draw_info_overlay(self, image, x, y):
         """
@@ -179,19 +225,20 @@ class PersonTrackerOSC:
                 # Convert to RGB for MediaPipe
                 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 
+                # Create MediaPipe Image
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+                
                 # Process pose detection
-                results = self.pose.process(image_rgb)
+                self.timestamp_ms += 33  # Approximate 30 FPS
+                detection_result = self.detector.detect_for_video(mp_image, self.timestamp_ms)
                 
                 # Extract position if person detected
-                if results.pose_landmarks:
+                if detection_result.pose_landmarks:
                     self.person_detected = True
                     
-                    # Get position
-                    x, y = self.get_closest_person_position(
-                        results.pose_landmarks,
-                        image.shape[1],
-                        image.shape[0]
-                    )
+                    # Get position from first detected person
+                    landmarks = detection_result.pose_landmarks[0]
+                    x, y = self.get_closest_person_position(landmarks)
                     
                     # Update last known position
                     self.last_x = x
@@ -201,12 +248,8 @@ class PersonTrackerOSC:
                     self.send_osc_data(x, y)
                     
                     # Draw pose landmarks
-                    self.mp_drawing.draw_landmarks(
-                        image,
-                        results.pose_landmarks,
-                        self.mp_pose.POSE_CONNECTIONS,
-                        landmark_drawing_spec=self.mp_drawing_styles.get_default_pose_landmarks_style()
-                    )
+                    image_rgb = self.draw_landmarks_on_image(image_rgb, detection_result)
+                    image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
                 else:
                     self.person_detected = False
                 
@@ -232,7 +275,7 @@ class PersonTrackerOSC:
         print("Cleaning up...")
         self.cap.release()
         cv2.destroyAllWindows()
-        self.pose.close()
+        self.detector.close()
         print("✓ Cleanup complete")
 
 
